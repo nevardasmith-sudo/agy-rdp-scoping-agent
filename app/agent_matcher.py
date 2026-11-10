@@ -33,12 +33,11 @@ from .tools.matcher import (
     normalize_repository_columns,
 )
 
+from .config import build_gemini_model
+
 matcher_agent = Agent(
     name="repository_matcher_ranker",
-    model=Gemini(
-        model="gemini-2.5-flash",
-        retry_options=types.HttpRetryOptions(attempts=3),
-    ),
+    model=build_gemini_model(),
     instruction=(
         "You are Agent 2: Deterministic Repository Matcher & Ranker for the Google Cloud "
         "Repeatable, Portable, and Demoable (RPD) Transformation Engine.\n"
@@ -61,6 +60,7 @@ matcher_agent = Agent(
         "5. Return the ranked candidate pool strictly conforming to `RankedUseCasePool`."
     ),
     output_schema=RankedUseCasePool,
+    output_key="ranked_use_case_pool",
     tools=[match_and_score_use_cases],
 )
 

@@ -20,8 +20,17 @@ try:
 except ImportError:  # pragma: no cover
     pd = None  # type: ignore
 
-_BUNDLED_DB_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "fsi_use_cases.db")
+from ..telemetry import emit_audit_log, start_rpd_span
+
+_APP_DATA_DB_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "data", "fsi_use_cases.db")
+)
+_BUNDLED_DB_PATH = (
+    _APP_DATA_DB_PATH
+    if os.path.exists(_APP_DATA_DB_PATH)
+    else os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "fsi_use_cases.db")
+    )
 )
 DEFAULT_DB_PATH = os.environ.get(
     "RPD_SQLITE_DB_PATH",
@@ -69,6 +78,25 @@ def is_deployed_and_not_in_development(status_val: Any) -> bool:
     if any(kw in status_upper for kw in DEVELOPMENT_OR_EXCLUDED_KEYWORDS):
         return False
     return status_upper in VALID_DEPLOYED_STATUSES
+
+
+class MatchUseCasesInput(BaseModel):
+    """Input validation contract for `match_and_score_use_cases`."""
+
+    customer_friction_points: list[str] = Field(
+        default_factory=list,
+        description="List of customer business and operational friction points to match against the repository",
+    )
+    industry_vertical: Optional[str] = Field(
+        default=None,
+        description="Optional target industry vertical or sub-industry filter (e.g., Insurance, Banking, Retail)",
+    )
+    top_k: int = Field(
+        default=25,
+        ge=1,
+        le=150,
+        description="Maximum number of ranked use case candidates to return (1 to 150)",
+    )
 
 
 class UseCaseCandidate(BaseModel):
@@ -166,26 +194,57 @@ def normalize_repository_columns(df: Any) -> Any:
     return df
 
 
+def _connect_readonly_sqlite(db_path: str) -> sqlite3.Connection:
+    """Opens a SQLite database connection in strict read-only URI mode (`?mode=ro`)."""
+    abs_path = os.path.abspath(db_path)
+    try:
+        conn = sqlite3.connect(f"file:{abs_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        conn = sqlite3.connect(abs_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _extract_stem_variants(word: str) -> set[str]:
+    """Generates normalized token and lightweight stem variants for semantic friction matching."""
+    clean = re.sub(r"[^a-z0-9]", "", word.lower())
+    if len(clean) <= 3:
+        return set()
+    variants = {clean}
+    for suffix in ("ments", "ment", "tion", "sion", "ings", "ing", "ities", "ity", "ed", "es", "s"):
+        if clean.endswith(suffix) and len(clean) - len(suffix) >= 4:
+            variants.add(clean[: -len(suffix)])
+    return variants
+
+
 def load_repository_from_sqlite(
     industry_vertical: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> list[dict[str, Any]]:
-    """Loads deployed, non-development use case records from the unified `use_cases` table in SQLite."""
+    """Loads deployed, non-development use case records from the unified `use_cases` table in SQLite.
+
+    Args:
+        industry_vertical: Optional industry domain or sub-industry filter.
+        db_path: Filesystem path to the SQLite database (`fsi_use_cases.db`).
+
+    Returns:
+        List of dictionary records representing verified deployed use cases.
+    """
     if not os.path.exists(db_path):
         return []
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    rows = [
-        dict(r)
-        for r in cur.execute("SELECT * FROM use_cases").fetchall()
-        if is_deployed_and_not_in_development(
-            r["raw_status"] if "raw_status" in r.keys() and r["raw_status"] else r["status"]
-        )
-    ]
-    conn.close()
+    conn = _connect_readonly_sqlite(db_path)
+    try:
+        cur = conn.cursor()
+        rows = [
+            dict(r)
+            for r in cur.execute("SELECT * FROM use_cases").fetchall()
+            if is_deployed_and_not_in_development(
+                r["raw_status"] if "raw_status" in r.keys() and r["raw_status"] else r["status"]
+            )
+        ]
+    finally:
+        conn.close()
 
     if not industry_vertical or not str(industry_vertical).strip():
         return rows
@@ -248,18 +307,39 @@ def match_and_score_use_cases(
     customer_friction_points: list[str],
     repository_data: Optional[list[dict[str, Any]]] = None,
     industry_vertical: Optional[str] = None,
+    top_k: int = 25,
 ) -> list[dict[str, Any]]:
     """Filters and ranks use cases from the repository based on hard gates and weighted criteria.
 
-    - Hard Gate 1: `is_field_ready` / `is_deployed_referenceable` (`status == 'Deployed - Field Ready'`)
+    Enforces two mandatory deterministic governance gates:
+    - Hard Gate 1: `is_deployed_and_not_in_development` (`status == 'Deployed - Field Ready'`)
     - Hard Gate 2: `has_customer_reference` (named `customer_reference` present)
-    - Weighted Scoring:
-      * +40 points for active Demo Link (`http://` or `https://`)
-      * +30 points for Business Capabilities / Architecture Sheet Link (`http://` or `https://`)
-      * Up to +30 points for semantic friction point fit
+
+    Weighted Scoring Model (0 to 100 points):
+    - +40 points for active Demo Link (`http://` or `https://`)
+    - +30 points for Business Capabilities / Architecture Sheet Link (`http://` or `https://`)
+    - Up to +30 points for stem-aware semantic friction point fit
+
+    Args:
+        customer_friction_points: List of customer business and operational friction points.
+        repository_data: Optional pre-loaded list of repository dictionaries (defaults to SQLite query).
+        industry_vertical: Optional target industry vertical or sub-industry filter.
+        top_k: Maximum number of top-ranked candidates to return (default 25, bounded 1..150).
+
+    Returns:
+        Ranked list of verified use case candidate dictionaries ordered by score descending.
     """
+    validated_input = MatchUseCasesInput(
+        customer_friction_points=[str(fp) for fp in (customer_friction_points or []) if str(fp).strip()],
+        industry_vertical=str(industry_vertical).strip() if industry_vertical else None,
+        top_k=max(1, min(int(top_k or 25), 150)),
+    )
+    clean_frictions = validated_input.customer_friction_points
+    clean_vertical = validated_input.industry_vertical
+    limit_k = validated_input.top_k
+
     if repository_data is None:
-        repository_data = load_repository_from_sqlite(industry_vertical=industry_vertical)
+        repository_data = load_repository_from_sqlite(industry_vertical=clean_vertical)
 
     if not repository_data:
         return []
@@ -272,10 +352,33 @@ def match_and_score_use_cases(
     else:
         records = normalize_repository_columns(repository_data)
 
-    # Enforce Hard Gate 1 & Hard Gate 2
-    qualified_records = [
-        r for r in records if _passes_hard_gate_1(r) and _passes_hard_gate_2(r)
-    ]
+    # Enforce Hard Gate 1 & Hard Gate 2 with OpenTelemetry span & structured audit logging
+    with start_rpd_span(
+        "rpd.match_and_score_use_cases",
+        {
+            "rpd.industry_vertical": str(clean_vertical or "all"),
+            "rpd.friction_point_count": len(clean_frictions),
+            "rpd.total_repo_candidates": len(records),
+        },
+    ) as span:
+        qualified_records = [
+            r for r in records if _passes_hard_gate_1(r) and _passes_hard_gate_2(r)
+        ]
+        rejected_count = len(records) - len(qualified_records)
+        span.set_attribute("rpd.qualified_candidates", len(qualified_records))
+        span.set_attribute("rpd.rejected_by_hard_gates", rejected_count)
+        emit_audit_log(
+            event_type="HARD_GATE_FILTER",
+            severity="INFO",
+            message=(
+                f"Hard Gates 1 & 2 evaluated {len(records)} records: "
+                f"{len(qualified_records)} qualified, {rejected_count} rejected."
+            ),
+            industry_vertical=str(clean_vertical or "all"),
+            total_repo_candidates=len(records),
+            qualified_candidates=len(qualified_records),
+            rejected_by_hard_gates=rejected_count,
+        )
 
     ranked_results: list[dict[str, Any]] = []
     for row in qualified_records:
@@ -297,7 +400,7 @@ def match_and_score_use_cases(
         if arch_url and arch_url.lower() != "none" and arch_url.startswith(("http://", "https://")):
             score += 30
 
-        # Priority Boost 3: Semantic Friction Fit (+30)
+        # Priority Boost 3: Stem-Aware Semantic Friction Fit (+30)
         searchable_blob = " ".join(
             [
                 str(row.get("use_case_name") or ""),
@@ -309,39 +412,40 @@ def match_and_score_use_cases(
         ).lower()
 
         matched_terms = 0
-        for friction in customer_friction_points or []:
-            words = [
-                re.sub(r"[^a-z0-9]", "", w.lower())
-                for w in str(friction).split()
-                if len(re.sub(r"[^a-z0-9]", "", w)) > 3
-            ]
-            if any(w in searchable_blob for w in words):
+        for friction in clean_frictions:
+            stem_candidates: set[str] = set()
+            for w in str(friction).split():
+                stem_candidates.update(_extract_stem_variants(w))
+            if any(stem in searchable_blob for stem in stem_candidates):
                 matched_terms += 1
 
-        if customer_friction_points:
+        if clean_frictions:
             semantic_score = min(
-                30, int((matched_terms / len(customer_friction_points)) * 30)
+                30, int((matched_terms / len(clean_frictions)) * 30)
             )
             score += semantic_score
 
+        candidate_model = UseCaseCandidate(
+            use_case_name=str(row.get("use_case_name") or ""),
+            use_case_description=str(row.get("use_case_description") or ""),
+            industry_domain=str(row.get("industry_domain") or ""),
+            sub_industry=str(row.get("sub_industry") or ""),
+            status="Deployed - Field Ready",
+            customer_reference=str(row.get("customer_reference") or ""),
+            demo_link=demo_url or raw_demo,
+            capabilities_sheet_link=arch_url or raw_arch,
+            business_value=str(row.get("business_value") or ""),
+            kpis=str(row.get("kpis") or ""),
+            score=score,
+        )
         ranked_results.append(
-            {
-                "use_case_name": str(row.get("use_case_name") or ""),
-                "use_case_description": str(row.get("use_case_description") or ""),
-                "industry_domain": str(row.get("industry_domain") or ""),
-                "sub_industry": str(row.get("sub_industry") or ""),
-                "status": "Deployed - Field Ready",
-                "customer_reference": str(row.get("customer_reference") or ""),
-                "demo_link": demo_url or raw_demo,
-                "capabilities_sheet_link": arch_url or raw_arch,
-                "business_value": str(row.get("business_value") or ""),
-                "kpis": str(row.get("kpis") or ""),
-                "score": score,
-            }
+            candidate_model.model_dump()
+            if hasattr(candidate_model, "model_dump")
+            else candidate_model.__dict__
         )
 
     ranked_results.sort(key=lambda x: x["score"], reverse=True)
-    return ranked_results
+    return ranked_results[:limit_k]
 
 
 if __name__ == "__main__":

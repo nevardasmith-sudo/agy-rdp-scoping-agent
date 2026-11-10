@@ -33,6 +33,13 @@ except ImportError:  # pragma: no cover
     types = _TypesStub()  # type: ignore
 
 from .agent_hitl import add_session_to_memory_callback
+from .telemetry import (
+    emit_audit_log,
+    start_rpd_span,
+    telemetry_after_tool_callback,
+    telemetry_before_tool_callback,
+    telemetry_on_model_error_callback,
+)
 
 
 class KpiAchievedItem(BaseModel):
@@ -84,18 +91,28 @@ class TransformationOpportunityReport(BaseModel):
 def synthesize_transformation_report(
     value_analysis_dossier: dict[str, Any],
 ) -> dict[str, Any]:
-    """Synthesizes `ValueAnalysisDossier` into `TransformationReportItem` records and an executive Markdown report."""
+    """Synthesizes `ValueAnalysisDossier` into `TransformationReportItem` records and an executive Markdown report.
+
+    Args:
+        value_analysis_dossier: Dictionary conforming to `ValueAnalysisDossier` containing
+            `customer_name`, `industry_vertical`, `manager_notes`, and `use_case_dossiers`.
+
+    Returns:
+        Dictionary conforming to `TransformationOpportunityReport` with `customer_name`,
+        `report_title`, `items`, `markdown_report`, and `formatted_markdown`.
+    """
+    dossier_dict = dict(value_analysis_dossier or {})
     customer_name = (
-        str(value_analysis_dossier.get("customer_name") or "Enterprise Customer").strip()
+        str(dossier_dict.get("customer_name") or "Enterprise Customer").strip()
     )
     industry_vertical = str(
-        value_analysis_dossier.get("industry_vertical") or ""
+        dossier_dict.get("industry_vertical") or ""
     ).strip()
-    manager_notes = str(value_analysis_dossier.get("manager_notes") or "").strip()
-    dossiers = value_analysis_dossier.get("use_case_dossiers") or []
+    manager_notes = str(dossier_dict.get("manager_notes") or "").strip()
+    dossiers = dossier_dict.get("use_case_dossiers") or dossier_dict.get("verified_use_cases") or []
 
     report_title = f"AI Transformation Opportunity for {customer_name}"
-    items: list[dict[str, Any]] = []
+    items: list[TransformationReportItem] = []
     md_sections: list[str] = [f"# {report_title}\n"]
 
     if industry_vertical:
@@ -115,28 +132,30 @@ def synthesize_transformation_report(
         ).strip()
         kpis = d.get("kpis_achieved") or []
 
-        report_item = {
-            "customer_name": customer_name,
-            "use_case_name": uc_name,
-            "use_case_description": uc_desc,
-            "business_value": biz_val,
-            "kpis_achieved": [
-                {
-                    "customer_reference": str(k.get("customer_reference") or "").strip(),
-                    "metric_impact": str(k.get("metric_impact") or "").strip(),
-                }
-                for k in kpis
-                if str(k.get("customer_reference") or "").strip()
-            ],
-            "demo_link": demo_link,
-            "business_capabilities_sheet_link": cap_link,
-        }
+        kpi_models = [
+            KpiAchievedItem(
+                customer_reference=str(k.get("customer_reference") or "").strip(),
+                metric_impact=str(k.get("metric_impact") or "").strip(),
+            )
+            for k in kpis
+            if str(k.get("customer_reference") or "").strip()
+        ]
+
+        report_item = TransformationReportItem(
+            customer_name=customer_name,
+            use_case_name=uc_name,
+            use_case_description=uc_desc,
+            business_value=biz_val,
+            kpis_achieved=kpi_models,
+            demo_link=demo_link,
+            business_capabilities_sheet_link=cap_link,
+        )
         items.append(report_item)
 
         kpi_bullets = "\n".join(
             [
-                f"  - **{k['customer_reference']}**: {k['metric_impact']}"
-                for k in report_item["kpis_achieved"]
+                f"  - **{k.customer_reference}**: {k.metric_impact}"
+                for k in report_item.kpis_achieved
             ]
         )
         md_sections.append(
@@ -150,21 +169,41 @@ def synthesize_transformation_report(
         )
 
     formatted_md = "\n".join(md_sections)
-    return {
-        "customer_name": customer_name,
-        "report_title": report_title,
-        "items": items,
-        "markdown_report": formatted_md,
-        "formatted_markdown": formatted_md,
-    }
+    with start_rpd_span(
+        "rpd.synthesize_transformation_report",
+        {
+            "rpd.customer_name": customer_name,
+            "rpd.report_item_count": len(items),
+        },
+    ):
+        report_model = TransformationOpportunityReport(
+            customer_name=customer_name,
+            report_title=report_title,
+            items=items,
+            markdown_report=formatted_md,
+        )
+        emit_audit_log(
+            event_type="REPORT_SYNTHESIZED",
+            severity="INFO",
+            message=f"Synthesized transformation report '{report_title}' with {len(items)} item(s).",
+            customer_name=customer_name,
+            report_title=report_title,
+            item_count=len(items),
+        )
+    dumped = (
+        report_model.model_dump()
+        if hasattr(report_model, "model_dump")
+        else report_model.__dict__
+    )
+    dumped["formatted_markdown"] = formatted_md
+    return dumped
 
+
+from .config import build_gemini_model, enforce_hitl_gate_before_tool
 
 opportunity_synthesizer_agent = Agent(
-    name="rpd_transformation_synthesizer",
-    model=Gemini(
-        model="gemini-2.5-flash",
-        retry_options=types.HttpRetryOptions(attempts=3),
-    ),
+    name="executive_opportunity_synthesizer",
+    model=build_gemini_model(),
     instruction=(
         "You are Agent 4: Executive AI Transformation Opportunity Synthesizer for Google Cloud Consulting.\n"
         "Your primary goal is to synthesize verified value dossiers into formal executive proposals "
@@ -178,6 +217,9 @@ opportunity_synthesizer_agent = Agent(
         "must match verified customer references exactly. Do not fabricate metrics.\n"
         "5. Enforce strict schema compliance for `TransformationReportItem`."
     ),
+    output_schema=TransformationOpportunityReport,
+    output_key="transformation_report",
+    before_tool_callback=[enforce_hitl_gate_before_tool],
     after_agent_callback=[add_session_to_memory_callback],
     tools=[synthesize_transformation_report],
 )

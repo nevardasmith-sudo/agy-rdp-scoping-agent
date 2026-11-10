@@ -35,7 +35,33 @@ except ImportError:  # pragma: no cover
     types = _TypesStub()  # type: ignore
 
 from .agent_hitl import add_session_to_memory_callback
-from .tools.matcher import DEFAULT_DB_PATH, INVALID_REF_VALUES
+from .telemetry import (
+    emit_audit_log,
+    start_rpd_span,
+    telemetry_after_tool_callback,
+    telemetry_before_tool_callback,
+    telemetry_on_model_error_callback,
+)
+from .tools.matcher import DEFAULT_DB_PATH, INVALID_REF_VALUES, _connect_readonly_sqlite
+
+
+class ExtractValueInput(BaseModel):
+    """Input validation contract for `extract_verified_value_and_kpis`."""
+
+    approved_use_cases: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of HITL-approved use case dictionaries",
+    )
+    customer_name: str = Field(
+        default="", description="Name of the target customer organization"
+    )
+    industry_vertical: str = Field(
+        default="", description="Primary industry vertical"
+    )
+    manager_notes: str = Field(
+        default="",
+        description="Executive notes or guidance provided by the AI Transformation Manager",
+    )
 
 
 class VerifiedKpiRecord(BaseModel):
@@ -99,19 +125,20 @@ class ValueAnalysisDossier(BaseModel):
 def _lookup_sqlite_record(
     use_case_name: str, db_path: str = DEFAULT_DB_PATH
 ) -> Optional[dict[str, Any]]:
-    """Looks up the authoritative repository row for `use_case_name` in SQLite."""
+    """Looks up the authoritative repository row for `use_case_name` in SQLite using read-only URI mode."""
     if not use_case_name:
         return None
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        row = cur.execute(
-            "SELECT * FROM use_cases WHERE LOWER(TRIM(use_case_name)) = LOWER(TRIM(?)) LIMIT 1",
-            (use_case_name,),
-        ).fetchone()
-        conn.close()
-        return dict(row) if row else None
+        conn = _connect_readonly_sqlite(db_path)
+        try:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT * FROM use_cases WHERE LOWER(TRIM(use_case_name)) = LOWER(TRIM(?)) LIMIT 1",
+                (use_case_name,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
     except Exception:
         return None
 
@@ -176,10 +203,25 @@ def extract_verified_value_and_kpis(
     - Binds metrics exclusively to verified customer outcomes in the repository.
     - Excludes any record lacking a named customer reference.
     - Prohibits ungrounded financial claims or fabricated ROI percentages.
-    """
-    use_case_dossiers: list[dict[str, Any]] = []
 
-    for item in approved_use_cases or []:
+    Args:
+        approved_use_cases: List of manager-approved use case dictionaries from the HITL gate.
+        customer_name: Name of the target customer organization.
+        industry_vertical: Primary industry vertical of the target customer.
+        manager_notes: Optional executive notes supplied at the HITL gate.
+
+    Returns:
+        Dictionary conforming to `ValueAnalysisDossier` with verified KPI records.
+    """
+    validated_req = ExtractValueInput(
+        approved_use_cases=list(approved_use_cases or []),
+        customer_name=str(customer_name or "").strip(),
+        industry_vertical=str(industry_vertical or "").strip(),
+        manager_notes=str(manager_notes or "").strip(),
+    )
+    use_case_dossiers: list[UseCaseValueAnalysis] = []
+
+    for item in validated_req.approved_use_cases:
         uc_name = str(
             item.get("use_case_name") or item.get("use_case_title") or ""
         ).strip()
@@ -195,6 +237,13 @@ def extract_verified_value_and_kpis(
 
         # Zero Hallucination Gate: drop if no verified customer reference exists
         if not customer_ref or customer_ref.lower() in INVALID_REF_VALUES:
+            emit_audit_log(
+                event_type="UNGROUNDED_KPI_BLOCKED",
+                severity="WARNING",
+                message=f"Blocked ungrounded use case lacking customer reference: {uc_name}",
+                use_case_name=uc_name,
+                reason="missing_customer_reference",
+            )
             continue
 
         description = str(
@@ -228,38 +277,51 @@ def extract_verified_value_and_kpis(
             or ""
         ).strip()
 
-        kpis_achieved = _parse_verified_kpis(customer_ref, kpis_raw, business_value)
-        if not kpis_achieved:
+        kpis_achieved_dicts = _parse_verified_kpis(customer_ref, kpis_raw, business_value)
+        if not kpis_achieved_dicts:
             continue
 
         use_case_dossiers.append(
-            {
-                "use_case_name": uc_name,
-                "use_case_description": description,
-                "value_driver": value_driver,
-                "business_value": business_value or value_driver,
-                "kpis_achieved": kpis_achieved,
-                "demo_link": demo_link,
-                "business_capabilities_sheet_link": cap_link,
-            }
+            UseCaseValueAnalysis(
+                use_case_name=uc_name,
+                use_case_description=description,
+                value_driver=value_driver,
+                business_value=business_value or value_driver,
+                kpis_achieved=[VerifiedKpiRecord(**k) for k in kpis_achieved_dicts],
+                demo_link=demo_link,
+                business_capabilities_sheet_link=cap_link,
+            )
         )
 
-    return {
-        "customer_name": customer_name,
-        "industry_vertical": industry_vertical,
-        "manager_notes": manager_notes,
-        "zero_hallucination_verified": True,
-        "use_case_dossiers": use_case_dossiers,
-        "verified_use_cases": use_case_dossiers,
-    }
+    with start_rpd_span(
+        "rpd.extract_verified_value_and_kpis",
+        {
+            "rpd.customer_name": validated_req.customer_name,
+            "rpd.input_approved_count": len(validated_req.approved_use_cases),
+            "rpd.verified_dossier_count": len(use_case_dossiers),
+        },
+    ):
+        dossier_model = ValueAnalysisDossier(
+            customer_name=validated_req.customer_name,
+            industry_vertical=validated_req.industry_vertical,
+            manager_notes=validated_req.manager_notes,
+            zero_hallucination_verified=True,
+            use_case_dossiers=use_case_dossiers,
+        )
+    dumped = (
+        dossier_model.model_dump()
+        if hasattr(dossier_model, "model_dump")
+        else dossier_model.__dict__
+    )
+    dumped["verified_use_cases"] = dumped.get("use_case_dossiers", [])
+    return dumped
 
+
+from .config import build_gemini_model, enforce_hitl_gate_before_tool
 
 value_driver_agent = Agent(
     name="value_driver_kpi_engine",
-    model=Gemini(
-        model="gemini-2.5-flash",
-        retry_options=types.HttpRetryOptions(attempts=3),
-    ),
+    model=build_gemini_model(),
     instruction=(
         "You are Agent 3: Value Driver & Realized KPI Engine for the Google Cloud "
         "Repeatable, Portable, and Demoable (RPD) Transformation Engine.\n"
@@ -275,6 +337,8 @@ value_driver_agent = Agent(
         "4. Output a structured JSON strictly conforming to `ValueAnalysisDossier`."
     ),
     output_schema=ValueAnalysisDossier,
+    output_key="value_analysis_dossier",
+    before_tool_callback=[enforce_hitl_gate_before_tool],
     after_agent_callback=[add_session_to_memory_callback],
     tools=[extract_verified_value_and_kpis],
 )
