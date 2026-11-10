@@ -11,16 +11,16 @@ stages:
     steps:
       - name: Checkout Source Code
         action: git.checkout
-      - name: Setup Python Environment
+      - name: Setup Reproducible Python Environment
         action: exec
         command: |
           pip install uv
-          uv venv
-          uv pip install -e .
-      - name: Validate Manifest & Syntax
+          uv sync --frozen
+      - name: Validate Syntax & Deterministic 5-Stage E2E Tests
         action: exec
         command: |
-          uv run python -m py_compile app/agent.py
+          uv run python -m py_compile app/agent.py app/config.py app/telemetry.py app/fast_api_app.py
+          uv run python test_pipeline.py
           cat agents-cli-manifest.yaml
   - name: Quality & Evaluation Gate
     runner: jetski-evaluator
@@ -30,8 +30,8 @@ stages:
         command: |
           uv run adk eval app rpd_eval_set.json --config_file_path=eval_config.json --print_detailed_results
         environment:
-          GOOGLE_GENAI_USE_VERTEXAI: "True"
-          GOOGLE_CLOUD_PROJECT: "gcp-experiments-349209"
+          GOOGLE_CLOUD_PROJECT: "nevardaai5days-sandbox-232845"
+          RPD_GOOGLE_CLOUD_PROJECT: "nevardaai5days-sandbox-232845"
   - name: Secure Agent Deployment
     runner: jetski-deployer
     requires:
@@ -46,7 +46,7 @@ stages:
             --non-interactive \
             --update-env-vars="GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true,OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental,OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=EVENT_ONLY,GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES=False"
         environment:
-          GOOGLE_CLOUD_PROJECT: "gcp-experiments-349209"
+          GOOGLE_CLOUD_PROJECT: "nevardaai5days-sandbox-232845"
   - name: Post-Deployment Observability Verification
     runner: jetski-monitor
     requires:
@@ -56,4 +56,4 @@ stages:
         action: exec
         command: |
           echo "Verifying SPIFFE Identity IAM bindings and Cloud Trace telemetry stream..."
-          gcloud logging logs list --project=gcp-experiments-349209 | grep reasoning_engine || true
+          gcloud logging logs list --project=nevardaai5days-sandbox-232845 | grep reasoning_engine || true

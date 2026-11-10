@@ -208,6 +208,21 @@ def run_e2e_test() -> None:
     health_status = healthz()
     assert health_status["status"] == "ok" and health_status["repository_db_ready"] is True
 
+    # Verify Item 5: Infrastructure, CI/CD, Dockerfile, eval_config.json, and 4-case rpd_eval_set.json
+    import json
+
+    assert os.path.exists(os.path.join(ROOT_DIR, "Dockerfile"))
+    assert os.path.exists(os.path.join(ROOT_DIR, ".antigravity", "github-actions-ci-cd.yml"))
+    assert os.path.exists(os.path.join(ROOT_DIR, ".antigravity", "pipeline.yaml"))
+
+    with open(os.path.join(ROOT_DIR, "eval_config.json"), encoding="utf-8") as f:
+        eval_cfg = json.load(f)
+    assert "tool_trajectory_avg_score" in eval_cfg["criteria"]
+
+    with open(os.path.join(ROOT_DIR, "rpd_eval_set.json"), encoding="utf-8") as f:
+        eval_set = json.load(f)
+    assert len(eval_set["eval_cases"]) == 4
+
     print("5. Final Report Markdown Preview:\n")
     print(report["formatted_markdown"][:1200])
 

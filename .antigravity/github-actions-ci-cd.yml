@@ -1,0 +1,46 @@
+name: RPD Scoping Agent CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - "release/*"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-verify:
+    name: Build, Lint & Deterministic Pipeline Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install astral-sh/uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Sync Locked Dependencies
+        run: uv sync --frozen
+
+      - name: Compile Python Modules & Check Manifest
+        run: |
+          uv run python -m py_compile app/agent.py app/config.py app/telemetry.py app/fast_api_app.py app/tools/matcher.py
+          cat agents-cli-manifest.yaml
+
+      - name: Execute Deterministic 5-Stage E2E & Governance Suite
+        run: uv run python test_pipeline.py
+
+      - name: Execute ADK Trajectory & Rubric Evaluations (When API Key Present)
+        if: ${{ secrets.GOOGLE_API_KEY != '' }}
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_GENAI_USE_VERTEXAI: "False"
+          RPD_GOOGLE_CLOUD_PROJECT: "nevardaai5days-sandbox-232845"
+        run: |
+          uv run adk eval app rpd_eval_set.json --config_file_path=eval_config.json --print_detailed_results
