@@ -92,7 +92,11 @@ class IngestSourcesOutput(BaseModel):
         description="URLs rejected by SSRF/private-IP security validation",
     )
     passage_count: int = Field(description="Number of discovery text passages ingested")
-    combined_context: str = Field(description="Unified customer context string")
+    pii_redactions_applied: int = Field(
+        default=0,
+        description="Number of PII or secret occurrences redacted from ingested sources",
+    )
+    combined_context: str = Field(description="PII-scrubbed unified customer context string")
 
 
 def _is_safe_public_url(url: str) -> bool:
@@ -239,16 +243,26 @@ def ingest_customer_sources(
             f"--- Raw User-Pasted Fallback Context ---\n{validated.raw_text_fallback}"
         )
 
-    unified_text = (
+    raw_unified_text = (
         "\n\n".join(combined_context)
         if combined_context
         else "--- No external URLs or discovery documents provided. Provide raw text context. ---"
     )
+    scrubbed_unified_text, pii_redactions = scrub_pii_with_count(raw_unified_text)
+    if pii_redactions > 0:
+        emit_audit_log(
+            event_type="PII_REDACTED",
+            severity="INFO",
+            message=f"Scrubbed {pii_redactions} PII/secret occurrence(s) from ingested customer discovery sources.",
+            pipeline_stage="discovery_ingestion",
+            redactions_applied=pii_redactions,
+        )
     output_obj = IngestSourcesOutput(
         url_count=len(validated.urls),
         blocked_ssrf_urls=blocked_ssrf_urls,
         passage_count=passage_count,
-        combined_context=unified_text,
+        pii_redactions_applied=pii_redactions,
+        combined_context=scrubbed_unified_text,
     )
     return (
         output_obj.model_dump()
@@ -260,6 +274,7 @@ def ingest_customer_sources(
 from .config import build_flash_model, build_gemini_model
 from .telemetry import (
     emit_audit_log,
+    scrub_pii_with_count,
     start_rpd_span,
     strategic_model_router_callback,
     telemetry_after_model_callback,

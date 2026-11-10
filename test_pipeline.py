@@ -75,15 +75,23 @@ def run_e2e_test() -> None:
     ingested = ingest_customer_sources(
         urls=["http://169.254.169.254/computeMetadata/v1/"],
         discovery_passages=[
-            "Global insurer experiencing manual claims triage delays, fragmented underwriting documents, and high call center handle times."
+            "Global insurer experiencing manual claims triage delays, fragmented underwriting documents, and high call center handle times. Contact Jane Doe at jane.doe@acmeinsurance.com or SSN 123-45-6789 or 415-555-0199."
         ],
     )
     assert len(ingested["blocked_ssrf_urls"]) == 1
+    assert ingested["pii_redactions_applied"] >= 3
+    assert "jane.doe@acmeinsurance.com" not in ingested["combined_context"]
+    assert "123-45-6789" not in ingested["combined_context"]
+    assert "[REDACTED_EMAIL]" in ingested["combined_context"]
+    assert "[REDACTED_SSN]" in ingested["combined_context"]
+    assert "[REDACTED_PHONE]" in ingested["combined_context"]
     print(
         "1. Discovery Ingested:",
         ingested["passage_count"],
         "passage(s) | Blocked SSRF URLs:",
         len(ingested["blocked_ssrf_urls"]),
+        "| PII Redactions:",
+        ingested["pii_redactions_applied"],
     )
 
     # Verify read-only SQLite URI enforcement blocks write attempts
@@ -178,12 +186,32 @@ def run_e2e_test() -> None:
     from app.telemetry import (
         AUDIT_LOG_BUFFER,
         SPAN_EXPORTER,
+        emit_audit_log,
+        scrub_pii,
+        scrub_session_and_memory_state,
         strategic_model_router_callback,
         telemetry_after_model_callback,
         telemetry_after_tool_callback,
         telemetry_before_tool_callback,
         telemetry_on_model_error_callback,
     )
+
+    # Verify PII scrubbing in logging and session memory pipelines
+    scrubbed_log = emit_audit_log(
+        event_type="CUSTOMER_NOTE_LOGGED",
+        message="Manager email is bob@acme.com and card is 4111-2222-3333-4444",
+        api_key="secret_key_value",
+    )
+    assert "[REDACTED_EMAIL]" in scrubbed_log["message"]
+    assert "[REDACTED_CREDIT_CARD]" in scrubbed_log["message"]
+    assert scrubbed_log["api_key"] == "[REDACTED_SENSITIVE_FIELD]"
+    assert scrubbed_log["pii_scrubbed"] is True
+
+    dummy_ctx.state["manager_contact"] = "Reach out to alice@acme.com or 123-45-6789"
+    redactions_in_memory = scrub_session_and_memory_state(dummy_ctx)
+    assert redactions_in_memory >= 2
+    assert "[REDACTED_EMAIL]" in dummy_ctx.state["manager_contact"]
+    assert "[REDACTED_SSN]" in dummy_ctx.state["manager_contact"]
 
     # Verify Strategic Model Routing across sub-agents (Flash vs Pro delegation)
     assert discovery_agent.model.model == FLASH_MODEL_NAME
@@ -235,6 +263,7 @@ def run_e2e_test() -> None:
         "LLM_MODEL_ERROR",
         "MODEL_ROUTING_DECISION",
         "LLM_TOKEN_USAGE",
+        "PII_REDACTED",
     ):
         assert expected_event in event_types, f"Missing audit event: {expected_event}"
 

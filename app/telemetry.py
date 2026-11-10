@@ -1,9 +1,10 @@
-"""OpenTelemetry Tracing & Google Cloud Structured JSON Audit Logging (app/telemetry.py)."""
+"""OpenTelemetry Tracing, PII Scrubbing, & Google Cloud Structured JSON Audit Logging (app/telemetry.py)."""
 
 import datetime
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
@@ -41,11 +42,172 @@ except ImportError:  # pragma: no cover
         pass
 
 
+# Deterministic PII & Secret Redaction Patterns
+PII_REDACTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Google API Keys, Vertex Keys, GitHub PATs, and Bearer Tokens
+    (
+        re.compile(
+            r"\b(?:AQ\.[A-Za-z0-9_\-]{20,}|AIza[0-9A-Za-z_\-]{35}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{20,})\b"
+        ),
+        "[REDACTED_SECRET]",
+    ),
+    (
+        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\._\-]{16,}\b"),
+        "Bearer [REDACTED_SECRET]",
+    ),
+    # US Social Security Numbers (SSN: XXX-XX-XXXX)
+    (
+        re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"),
+        "[REDACTED_SSN]",
+    ),
+    # Payment / Credit Card Numbers (13-16 digits with spaces or dashes)
+    (
+        re.compile(r"\b(?:\d{4}[-\s]){3}\d{4}\b|\b\d{15,16}\b"),
+        "[REDACTED_CREDIT_CARD]",
+    ),
+    # Email Addresses
+    (
+        re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+        "[REDACTED_EMAIL]",
+    ),
+    # North American & International Phone Numbers
+    (
+        re.compile(
+            r"(?<!\d)(?:\+?1[\s.\-]?)?\(?\d{3}\)[\s.\-]?\d{3}[\s.\-]\d{4}(?!\d)|(?<!\d)(?:\+?1[\s.\-])?\d{3}[\s.\-]\d{3}[\s.\-]\d{4}(?!\d)"
+        ),
+        "[REDACTED_PHONE]",
+    ),
+]
+
+SENSITIVE_KEY_NAMES = {
+    "password",
+    "passwd",
+    "secret",
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "private_key",
+    "ssn",
+    "social_security_number",
+    "credit_card",
+    "card_number",
+    "tax_id",
+}
+
+
+def scrub_pii_with_count(text: str) -> tuple[str, int]:
+    """Scrubs PII and secrets from a string, returning `(scrubbed_text, total_redactions)`."""
+    if not text or not isinstance(text, str):
+        return text, 0
+    scrubbed = text
+    total_count = 0
+    for pattern, replacement in PII_REDACTION_PATTERNS:
+        scrubbed, count = pattern.subn(replacement, scrubbed)
+        total_count += count
+    return scrubbed, total_count
+
+
+def scrub_pii(text: str) -> str:
+    """Scrubs PII and secrets from a string."""
+    scrubbed, _ = scrub_pii_with_count(text)
+    return scrubbed
+
+
+def scrub_pii_payload(payload: Any) -> tuple[Any, int]:
+    """Recursively scrubs PII and sensitive keys across dicts, lists, tuples, and strings."""
+    if isinstance(payload, str):
+        return scrub_pii_with_count(payload)
+    if isinstance(payload, dict):
+        out_dict: dict[str, Any] = {}
+        total_redactions = 0
+        for k, v in payload.items():
+            key_lower = str(k).strip().lower()
+            if key_lower in SENSITIVE_KEY_NAMES and v:
+                out_dict[k] = "[REDACTED_SENSITIVE_FIELD]"
+                total_redactions += 1
+            else:
+                clean_v, count = scrub_pii_payload(v)
+                out_dict[k] = clean_v
+                total_redactions += count
+        return out_dict, total_redactions
+    if isinstance(payload, list):
+        out_list: list[Any] = []
+        total_redactions = 0
+        for item in payload:
+            clean_item, count = scrub_pii_payload(item)
+            out_list.append(clean_item)
+            total_redactions += count
+        return out_list, total_redactions
+    if isinstance(payload, tuple):
+        out_items: list[Any] = []
+        total_redactions = 0
+        for item in payload:
+            clean_item, count = scrub_pii_payload(item)
+            out_items.append(clean_item)
+            total_redactions += count
+        return tuple(out_items), total_redactions
+    return payload, 0
+
+
+def scrub_session_and_memory_state(callback_context: Any) -> int:
+    """Actively scrubs PII from ADK session state and conversation events prior to Memory Bank persistence."""
+    total_redactions = 0
+    state = getattr(callback_context, "state", None)
+    if state is not None and hasattr(state, "items"):
+        keys_to_update: dict[str, Any] = {}
+        for k, v in list(state.items()):
+            clean_v, count = scrub_pii_payload(v)
+            if count > 0:
+                keys_to_update[k] = clean_v
+                total_redactions += count
+        for k, clean_v in keys_to_update.items():
+            state[k] = clean_v
+
+    inv_ctx = getattr(callback_context, "_invocation_context", None)
+    session_obj = getattr(inv_ctx, "session", None)
+    events = getattr(session_obj, "events", None) or []
+    for event in events:
+        content = getattr(event, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str) and part_text:
+                clean_text, count = scrub_pii_with_count(part_text)
+                if count > 0:
+                    part.text = clean_text
+                    total_redactions += count
+
+    if total_redactions > 0:
+        emit_audit_log(
+            event_type="PII_REDACTED",
+            severity="INFO",
+            message=f"Scrubbed {total_redactions} PII/secret occurrence(s) from session memory pipeline.",
+            pipeline_stage="memory_persistence",
+            redactions_applied=total_redactions,
+        )
+    return total_redactions
+
+
+class PiiRedactingFilter(logging.Filter):
+    """Logging filter that guarantees no unredacted PII or secrets leave the Python logger."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = scrub_pii(record.msg)
+        if record.args:
+            clean_args, _ = scrub_pii_payload(record.args)
+            record.args = clean_args
+        return True
+
+
 _audit_logger = logging.getLogger("rpd.scoping.audit")
 if not _audit_logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(message)s"))
+    _handler.addFilter(PiiRedactingFilter())
     _audit_logger.addHandler(_handler)
+_audit_logger.addFilter(PiiRedactingFilter())
 _audit_logger.setLevel(logging.INFO)
 _audit_logger.propagate = False
 
@@ -119,7 +281,8 @@ def start_rpd_span(
 
     with tracer.start_as_current_span(span_name) as span:
         if attributes:
-            for k, v in attributes.items():
+            clean_attrs, _ = scrub_pii_payload(attributes)
+            for k, v in clean_attrs.items():
                 if v is not None:
                     span.set_attribute(k, v)
         yield span
@@ -145,19 +308,27 @@ def emit_audit_log(
     message: str = "",
     **fields: Any,
 ) -> dict[str, Any]:
-    """Emits a Google Cloud Structured JSON log entry for governance and HITL auditing."""
+    """Emits a PII-scrubbed Google Cloud Structured JSON log entry for governance and HITL auditing."""
     project_id = os.environ.get(
         "RPD_GOOGLE_CLOUD_PROJECT",
         os.environ.get("GOOGLE_CLOUD_PROJECT", "nevardaai5days-sandbox-232845"),
     )
     trace_hex = _current_trace_id_hex()
+    raw_msg = message or f"RPD governance event: {event_type}"
+    clean_msg, msg_redactions = scrub_pii_with_count(raw_msg)
+    clean_fields, field_redactions = scrub_pii_payload(fields)
+    total_redactions = msg_redactions + field_redactions
+
     entry: dict[str, Any] = {
         "severity": severity.upper(),
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "rpd_event_type": event_type,
-        "message": message or f"RPD governance event: {event_type}",
-        **fields,
+        "message": clean_msg,
+        "pii_scrubbed": total_redactions > 0,
+        **clean_fields,
     }
+    if total_redactions > 0:
+        entry["pii_redactions_count"] = total_redactions
     if trace_hex:
         entry["logging.googleapis.com/trace"] = f"projects/{project_id}/traces/{trace_hex}"
 
@@ -247,6 +418,21 @@ def strategic_model_router_callback(
     - Emits an OpenTelemetry span (`rpd.strategic_model_router`) and a `MODEL_ROUTING_DECISION` audit log.
     """
     from .config import AGENT_MODEL_ROUTING_TABLE, FLASH_MODEL_NAME, PRO_MODEL_NAME
+
+    # Scrub any PII from session state and incoming LLM request contents before model execution
+    scrub_session_and_memory_state(callback_context)
+    contents_obj = getattr(llm_request, "contents", None)
+    if isinstance(contents_obj, str):
+        clean_contents, redaction_cnt = scrub_pii_with_count(contents_obj)
+        if redaction_cnt > 0:
+            llm_request.contents = clean_contents
+    elif isinstance(contents_obj, list):
+        for content_item in contents_obj:
+            for part in getattr(content_item, "parts", None) or []:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text:
+                    clean_part, _ = scrub_pii_with_count(part_text)
+                    part.text = clean_part
 
     agent_name = str(getattr(callback_context, "agent_name", "") or "rpd_transformation_synthesizer")
     state = getattr(callback_context, "state", None)

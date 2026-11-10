@@ -94,6 +94,10 @@ def initialize_rpd_session_state(callback_context: CallbackContext) -> None:
 
 
 async def add_session_to_memory_callback(callback_context: CallbackContext):
+    """Scrubs PII from session state and conversation history before persisting to Agent Memory Bank."""
+    from .telemetry import scrub_session_and_memory_state
+
+    scrub_session_and_memory_state(callback_context)
     if hasattr(callback_context, "add_session_to_memory"):
         await callback_context.add_session_to_memory()
     return None
@@ -179,8 +183,13 @@ from .config import (
 )
 from .telemetry import (
     AUDIT_LOG_BUFFER,
+    PiiRedactingFilter,
     configure_opentelemetry,
     emit_audit_log,
+    scrub_pii,
+    scrub_pii_payload,
+    scrub_pii_with_count,
+    scrub_session_and_memory_state,
     start_rpd_span,
     strategic_model_router_callback,
     telemetry_after_model_callback,

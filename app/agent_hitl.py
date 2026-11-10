@@ -48,6 +48,8 @@ except ImportError:  # pragma: no cover
 
 from .telemetry import (
     emit_audit_log,
+    scrub_pii_payload,
+    scrub_session_and_memory_state,
     start_rpd_span,
     telemetry_after_tool_callback,
     telemetry_before_tool_callback,
@@ -82,7 +84,8 @@ class ApprovedUseCases(BaseModel):
 
 
 async def add_session_to_memory_callback(callback_context: CallbackContext) -> None:
-    """Triggers asynchronous background scanning of conversation history to extract persistent facts into Agent Memory Bank."""
+    """Scrubs PII from session state/events and triggers asynchronous extraction into Agent Memory Bank."""
+    scrub_session_and_memory_state(callback_context)
     if hasattr(callback_context, "add_session_to_memory"):
         await callback_context.add_session_to_memory()
     return None
@@ -108,15 +111,25 @@ def _resolve_session_id(
 
 
 def _persist_hitl_checkpoint(session_id: str, payload: dict[str, Any]) -> str:
-    """Persists HITL selection state to Firestore (when configured) and local session store."""
-    _LOCAL_HITL_SESSION_STORE[session_id] = payload
+    """Scrubs PII and persists HITL selection state to Firestore (when configured) and local session store."""
+    clean_payload, redaction_count = scrub_pii_payload(payload)
+    if redaction_count > 0:
+        emit_audit_log(
+            event_type="PII_REDACTED",
+            severity="INFO",
+            message=f"Scrubbed {redaction_count} PII/secret occurrence(s) from HITL checkpoint before persistence.",
+            pipeline_stage="hitl_checkpoint",
+            session_id=session_id,
+            redactions_applied=redaction_count,
+        )
+    _LOCAL_HITL_SESSION_STORE[session_id] = clean_payload
     project_id = os.environ.get(
         "RPD_GOOGLE_CLOUD_PROJECT", os.environ.get("GOOGLE_CLOUD_PROJECT")
     )
     if firestore is not None and project_id and os.environ.get("RPD_ENABLE_FIRESTORE_HITL") == "true":
         try:
             client = firestore.Client(project=project_id)
-            client.collection("rpd_hitl_checkpoints").document(session_id).set(payload)
+            client.collection("rpd_hitl_checkpoints").document(session_id).set(clean_payload)
             return "firestore"
         except Exception:
             return "in_memory_fallback"
