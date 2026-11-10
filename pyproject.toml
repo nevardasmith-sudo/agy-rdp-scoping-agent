@@ -1,6 +1,6 @@
 [project]
 name = "agy-rpd-scoping-agent"
-version = "0.1.0"
+version = "1.0.0"
 description = "Repeatable, Portable, and Demoable (RPD) Transformation Engine ADK Agent for the Gemini Enterprise Agent Platform"
 readme = "README.md"
 requires-python = ">=3.10"
