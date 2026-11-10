@@ -317,11 +317,15 @@ def extract_verified_value_and_kpis(
     return dumped
 
 
-from .config import build_gemini_model, enforce_hitl_gate_before_tool
+from .config import build_gemini_model, build_pro_model, enforce_hitl_gate_before_tool
+from .telemetry import (
+    strategic_model_router_callback,
+    telemetry_after_model_callback,
+)
 
 value_driver_agent = Agent(
     name="value_driver_kpi_engine",
-    model=build_gemini_model(),
+    model=build_pro_model(),
     instruction=(
         "You are Agent 3: Value Driver & Realized KPI Engine for the Google Cloud "
         "Repeatable, Portable, and Demoable (RPD) Transformation Engine.\n"
@@ -338,7 +342,11 @@ value_driver_agent = Agent(
     ),
     output_schema=ValueAnalysisDossier,
     output_key="value_analysis_dossier",
-    before_tool_callback=[enforce_hitl_gate_before_tool],
+    before_model_callback=[strategic_model_router_callback],
+    after_model_callback=[telemetry_after_model_callback],
+    before_tool_callback=[enforce_hitl_gate_before_tool, telemetry_before_tool_callback],
+    after_tool_callback=[telemetry_after_tool_callback],
+    on_model_error_callback=[telemetry_on_model_error_callback],
     after_agent_callback=[add_session_to_memory_callback],
     tools=[extract_verified_value_and_kpis],
 )

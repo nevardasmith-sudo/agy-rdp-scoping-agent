@@ -199,11 +199,15 @@ def synthesize_transformation_report(
     return dumped
 
 
-from .config import build_gemini_model, enforce_hitl_gate_before_tool
+from .config import build_gemini_model, build_pro_model, enforce_hitl_gate_before_tool
+from .telemetry import (
+    strategic_model_router_callback,
+    telemetry_after_model_callback,
+)
 
 opportunity_synthesizer_agent = Agent(
     name="executive_opportunity_synthesizer",
-    model=build_gemini_model(),
+    model=build_pro_model(),
     instruction=(
         "You are Agent 4: Executive AI Transformation Opportunity Synthesizer for Google Cloud Consulting.\n"
         "Your primary goal is to synthesize verified value dossiers into formal executive proposals "
@@ -219,7 +223,11 @@ opportunity_synthesizer_agent = Agent(
     ),
     output_schema=TransformationOpportunityReport,
     output_key="transformation_report",
-    before_tool_callback=[enforce_hitl_gate_before_tool],
+    before_model_callback=[strategic_model_router_callback],
+    after_model_callback=[telemetry_after_model_callback],
+    before_tool_callback=[enforce_hitl_gate_before_tool, telemetry_before_tool_callback],
+    after_tool_callback=[telemetry_after_tool_callback],
+    on_model_error_callback=[telemetry_on_model_error_callback],
     after_agent_callback=[add_session_to_memory_callback],
     tools=[synthesize_transformation_report],
 )

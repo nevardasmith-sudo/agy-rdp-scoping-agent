@@ -173,14 +173,51 @@ def run_e2e_test() -> None:
     report = synthesize_transformation_report(dossier)
 
     # Verify Item 4: OpenTelemetry spans, Structured Audit Logs, Callbacks, and FastAPI /healthz
+    from app.config import FLASH_MODEL_NAME, PRO_MODEL_NAME
     from app.fast_api_app import healthz
     from app.telemetry import (
         AUDIT_LOG_BUFFER,
         SPAN_EXPORTER,
+        strategic_model_router_callback,
+        telemetry_after_model_callback,
         telemetry_after_tool_callback,
         telemetry_before_tool_callback,
         telemetry_on_model_error_callback,
     )
+
+    # Verify Strategic Model Routing across sub-agents (Flash vs Pro delegation)
+    assert discovery_agent.model.model == FLASH_MODEL_NAME
+    assert matcher_agent.model.model == FLASH_MODEL_NAME
+    assert hitl_curator_agent.model.model == FLASH_MODEL_NAME
+    assert value_driver_agent.model.model == PRO_MODEL_NAME
+    assert opportunity_synthesizer_agent.model.model == PRO_MODEL_NAME
+
+    # Verify dynamic before_model_callback routes pre-HITL to Flash and post-HITL / complex synthesis to Pro
+    class _DummyLlmRequest:
+        def __init__(self, contents: str) -> None:
+            self.model = ""
+            self.contents = contents
+
+    class _DummyUsage:
+        prompt_token_count = 120
+        candidates_token_count = 80
+        total_token_count = 200
+
+    class _DummyLlmResponse:
+        usage_metadata = _DummyUsage()
+
+    dummy_ctx.state["hitl_confirmed"] = False
+    req_flash = _DummyLlmRequest("Match Insurance use cases")
+    strategic_model_router_callback(dummy_ctx, req_flash)  # type: ignore[arg-type]
+    assert req_flash.model == FLASH_MODEL_NAME
+    assert dummy_ctx.state["active_model_tier"] == "FLASH_LOW_LATENCY"
+
+    dummy_ctx.state["hitl_confirmed"] = True
+    req_pro = _DummyLlmRequest("Synthesize executive transformation report")
+    strategic_model_router_callback(dummy_ctx, req_pro)  # type: ignore[arg-type]
+    assert req_pro.model == PRO_MODEL_NAME
+    assert dummy_ctx.state["active_model_tier"] == "PRO_COMPLEX_REASONING"
+    telemetry_after_model_callback(dummy_ctx, _DummyLlmResponse())  # type: ignore[arg-type]
 
     telemetry_before_tool_callback(_DummyTool("match_and_score_use_cases"), {"industry_vertical": "Insurance"}, dummy_ctx)  # type: ignore[arg-type]
     telemetry_after_tool_callback(_DummyTool("match_and_score_use_cases"), {"industry_vertical": "Insurance"}, dummy_ctx, {"status": "ok"})  # type: ignore[arg-type]
@@ -196,6 +233,8 @@ def run_e2e_test() -> None:
         "TOOL_INVOCATION_START",
         "TOOL_INVOCATION_COMPLETE",
         "LLM_MODEL_ERROR",
+        "MODEL_ROUTING_DECISION",
+        "LLM_TOKEN_USAGE",
     ):
         assert expected_event in event_types, f"Missing audit event: {expected_event}"
 
@@ -204,6 +243,7 @@ def run_e2e_test() -> None:
         assert "rpd.match_and_score_use_cases" in span_names
         assert "rpd.extract_verified_value_and_kpis" in span_names
         assert "rpd.synthesize_transformation_report" in span_names
+        assert "rpd.strategic_model_router" in span_names
 
     health_status = healthz()
     assert health_status["status"] == "ok" and health_status["repository_db_ready"] is True

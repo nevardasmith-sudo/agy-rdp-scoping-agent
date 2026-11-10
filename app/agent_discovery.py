@@ -257,10 +257,12 @@ def ingest_customer_sources(
     )
 
 
-from .config import build_gemini_model
+from .config import build_flash_model, build_gemini_model
 from .telemetry import (
     emit_audit_log,
     start_rpd_span,
+    strategic_model_router_callback,
+    telemetry_after_model_callback,
     telemetry_after_tool_callback,
     telemetry_before_tool_callback,
     telemetry_on_model_error_callback,
@@ -268,7 +270,7 @@ from .telemetry import (
 
 discovery_agent = Agent(
     name="discovery_industry_classifier",
-    model=build_gemini_model(),
+    model=build_flash_model(),
     instruction=(
         "You are Agent 1: Enterprise Discovery & Industry Classifier for the Google Cloud "
         "Repeatable, Portable, and Demoable (RPD) Transformation Engine.\n"
@@ -287,6 +289,8 @@ discovery_agent = Agent(
     ),
     output_schema=CustomerContextSchema,
     output_key="customer_context",
+    before_model_callback=[strategic_model_router_callback],
+    after_model_callback=[telemetry_after_model_callback],
     before_tool_callback=[telemetry_before_tool_callback],
     after_tool_callback=[telemetry_after_tool_callback],
     on_model_error_callback=[telemetry_on_model_error_callback],

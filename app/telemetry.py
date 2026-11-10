@@ -231,3 +231,121 @@ def telemetry_on_model_error_callback(
         invocation_id=str(getattr(callback_context, "invocation_id", "") or ""),
     )
     return None
+
+
+def strategic_model_router_callback(
+    callback_context: CallbackContext, llm_request: Any
+) -> Optional[Any]:
+    """ADK `before_model_callback` implementing Strategic Model Routing between Flash and Pro tiers.
+
+    Routing Logic:
+    - Delegates complex reasoning, Zero-Hallucination KPI verification (`value_driver_kpi_engine`),
+      and Executive Synthesis (`executive_opportunity_synthesizer`, or post-HITL confirmed turns on
+      `rpd_transformation_synthesizer`) to the **Pro** model tier (`PRO_MODEL_NAME`).
+    - Routes high-throughput ingestion, SQLite repository matching, and pre-HITL candidate presentation
+      to the **Flash** model tier (`FLASH_MODEL_NAME`) for low latency and FinOps efficiency.
+    - Emits an OpenTelemetry span (`rpd.strategic_model_router`) and a `MODEL_ROUTING_DECISION` audit log.
+    """
+    from .config import AGENT_MODEL_ROUTING_TABLE, FLASH_MODEL_NAME, PRO_MODEL_NAME
+
+    agent_name = str(getattr(callback_context, "agent_name", "") or "rpd_transformation_synthesizer")
+    state = getattr(callback_context, "state", None)
+    hitl_confirmed = bool(state.get("hitl_confirmed")) if state is not None else False
+
+    # Inspect request contents for complex synthesis/value keywords when on root_agent
+    request_text = str(getattr(llm_request, "contents", "") or "").lower()
+    is_complex_synthesis_turn = (
+        agent_name in ("value_driver_kpi_engine", "executive_opportunity_synthesizer")
+        or hitl_confirmed
+        or any(
+            kw in request_text
+            for kw in (
+                "synthesize_transformation_report",
+                "extract_verified_value_and_kpis",
+                "executive report",
+                "transformation opportunity for",
+                "value dossier",
+            )
+        )
+    )
+
+    if is_complex_synthesis_turn:
+        selected_model = PRO_MODEL_NAME
+        routing_tier = "PRO_COMPLEX_REASONING"
+        routing_reason = (
+            f"Delegated `{agent_name}` to Pro tier (`{PRO_MODEL_NAME}`) for Zero-Hallucination KPI "
+            "verification and executive opportunity synthesis."
+        )
+    else:
+        route_entry = AGENT_MODEL_ROUTING_TABLE.get(agent_name, {})
+        selected_model = route_entry.get("model", FLASH_MODEL_NAME)
+        if agent_name == "rpd_transformation_synthesizer":
+            selected_model = FLASH_MODEL_NAME
+        routing_tier = "FLASH_LOW_LATENCY"
+        routing_reason = (
+            f"Routed `{agent_name}` to Flash tier (`{selected_model}`) for low-latency discovery, "
+            "deterministic SQLite matching, and HITL candidate presentation."
+        )
+
+    if llm_request is not None and hasattr(llm_request, "model"):
+        llm_request.model = selected_model
+
+    if state is not None:
+        state["active_model_tier"] = routing_tier
+        state["active_model_name"] = selected_model
+
+    with start_rpd_span(
+        "rpd.strategic_model_router",
+        {
+            "rpd.model_routing.agent_name": agent_name,
+            "rpd.model_routing.tier": routing_tier,
+            "rpd.model_routing.selected_model": selected_model,
+            "rpd.model_routing.hitl_confirmed": hitl_confirmed,
+        },
+    ):
+        emit_audit_log(
+            event_type="MODEL_ROUTING_DECISION",
+            severity="INFO",
+            message=routing_reason,
+            agent_name=agent_name,
+            model_tier=routing_tier,
+            selected_model=selected_model,
+            hitl_confirmed=hitl_confirmed,
+            invocation_id=str(getattr(callback_context, "invocation_id", "") or ""),
+        )
+    return None
+
+
+def telemetry_after_model_callback(
+    callback_context: CallbackContext, llm_response: Any
+) -> Optional[Any]:
+    """ADK `after_model_callback` recording token consumption by strategic model tier."""
+    state = getattr(callback_context, "state", None)
+    model_tier = (
+        str(state.get("active_model_tier") or "UNKNOWN")
+        if state is not None
+        else "UNKNOWN"
+    )
+    selected_model = (
+        str(state.get("active_model_name") or "")
+        if state is not None
+        else ""
+    )
+    usage = getattr(llm_response, "usage_metadata", None)
+    prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
+    candidate_tokens = int(getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
+    total_tokens = int(getattr(usage, "total_token_count", 0) or 0) if usage else 0
+
+    emit_audit_log(
+        event_type="LLM_TOKEN_USAGE",
+        severity="INFO",
+        message=f"Model `{selected_model}` ({model_tier}) consumed {total_tokens} total tokens.",
+        agent_name=str(getattr(callback_context, "agent_name", "") or ""),
+        model_tier=model_tier,
+        selected_model=selected_model,
+        prompt_token_count=prompt_tokens,
+        candidates_token_count=candidate_tokens,
+        total_token_count=total_tokens,
+        invocation_id=str(getattr(callback_context, "invocation_id", "") or ""),
+    )
+    return None

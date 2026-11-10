@@ -165,9 +165,16 @@ from .agent_value import (
 )
 
 from .config import (
+    AGENT_MODEL_ROUTING_TABLE,
     EscalationChecker,
+    FLASH_LITE_MODEL_NAME,
+    FLASH_MODEL_NAME,
     MODEL_NAME,
+    PRO_MODEL_NAME,
+    build_flash_lite_model,
+    build_flash_model,
     build_gemini_model,
+    build_pro_model,
     enforce_hitl_gate_before_tool,
 )
 from .telemetry import (
@@ -175,13 +182,17 @@ from .telemetry import (
     configure_opentelemetry,
     emit_audit_log,
     start_rpd_span,
+    strategic_model_router_callback,
+    telemetry_after_model_callback,
     telemetry_after_tool_callback,
     telemetry_before_tool_callback,
     telemetry_on_model_error_callback,
 )
 
 configure_opentelemetry()
-_shared_gemini_model = build_gemini_model(MODEL_NAME)
+_flash_lite_model = build_flash_lite_model()
+_flash_model = build_flash_model()
+_pro_model = build_pro_model()
 
 zero_hallucination_checker = EscalationChecker(
     name="zero_hallucination_escalation_checker",
@@ -206,11 +217,14 @@ rpd_sequential_pipeline = SequentialAgent(
 
 root_agent = Agent(
     name="rpd_transformation_synthesizer",
-    model=_shared_gemini_model,
+    model=_pro_model,
     instruction=(
         "You are an Executive AI Transformation Opportunity Synthesizer for Google Cloud Consulting. "
         "Your primary goal is to guide AI Transformation Managers through the 5-stage RPD workflow "
         "and synthesize verified value dossiers into formal executive proposals.\n"
+        "STRATEGIC MODEL ROUTING:\n"
+        f"- High-throughput ingestion, SQLite repository matching, and HITL checkpointing run on the Flash tier (`{FLASH_MODEL_NAME}`).\n"
+        f"- Complex reasoning, Zero-Hallucination KPI verification, and Executive Opportunity Synthesis escalate to the Pro tier (`{PRO_MODEL_NAME}`).\n"
         "WORKFLOW & ORCHESTRATION RULES:\n"
         "1. Stage 1 (Discovery): Use `ingest_customer_sources` when customer URLs or discovery documents are provided.\n"
         "2. Stage 2 (Repository Matching): Use `match_and_score_use_cases` to filter `fsi_use_cases.db` by Hard Gates 1 & 2 and score by Demo (+40), Capabilities Link (+30), and Friction Fit (+30).\n"
@@ -224,6 +238,8 @@ root_agent = Agent(
         "- ZERO HALLUCINATION: All KPI impact figures must match verified customer references in the repository exactly. Do not fabricate metrics."
     ),
     before_agent_callback=[initialize_rpd_session_state],
+    before_model_callback=[strategic_model_router_callback],
+    after_model_callback=[telemetry_after_model_callback],
     before_tool_callback=[enforce_hitl_gate_before_tool, telemetry_before_tool_callback],
     after_tool_callback=[telemetry_after_tool_callback],
     on_model_error_callback=[telemetry_on_model_error_callback],
@@ -242,7 +258,7 @@ app = App(
     root_agent=root_agent,
     name="rpd_scoping_app",
     events_compaction_config=EventsCompactionConfig(
-        summarizer=LlmEventSummarizer(llm=_shared_gemini_model),
+        summarizer=LlmEventSummarizer(llm=_flash_lite_model),
         compaction_interval=5,
         overlap_size=1,
     ),
@@ -259,6 +275,15 @@ __all__ = [
     "KpiAchievedItem",
     "TransformationReportItem",
     "TransformationOpportunityReport",
+    "AGENT_MODEL_ROUTING_TABLE",
+    "FLASH_LITE_MODEL_NAME",
+    "FLASH_MODEL_NAME",
+    "PRO_MODEL_NAME",
+    "build_flash_lite_model",
+    "build_flash_model",
+    "build_pro_model",
+    "strategic_model_router_callback",
+    "telemetry_after_model_callback",
     "EscalationChecker",
     "enforce_hitl_gate_before_tool",
     "initialize_rpd_session_state",

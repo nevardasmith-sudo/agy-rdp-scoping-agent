@@ -318,11 +318,15 @@ def submit_approved_use_cases(
     return result
 
 
-from .config import build_gemini_model, enforce_hitl_gate_before_tool
+from .config import build_flash_model, build_gemini_model, enforce_hitl_gate_before_tool
+from .telemetry import (
+    strategic_model_router_callback,
+    telemetry_after_model_callback,
+)
 
 hitl_curator_agent = Agent(
     name="solution_curator_hitl",
-    model=build_gemini_model(),
+    model=build_flash_model(),
     instruction=(
         "You are the HITL Gateway: Solution Curator for the Google Cloud Repeatable, Portable, "
         "and Demoable (RPD) Transformation Engine.\n"
@@ -337,7 +341,11 @@ hitl_curator_agent = Agent(
         "are transmitted downstream to Agent 3."
     ),
     output_key="approved_use_cases",
-    before_tool_callback=[enforce_hitl_gate_before_tool],
+    before_model_callback=[strategic_model_router_callback],
+    after_model_callback=[telemetry_after_model_callback],
+    before_tool_callback=[enforce_hitl_gate_before_tool, telemetry_before_tool_callback],
+    after_tool_callback=[telemetry_after_tool_callback],
+    on_model_error_callback=[telemetry_on_model_error_callback],
     after_agent_callback=[add_session_to_memory_callback],
     tools=[present_candidates_for_review, submit_approved_use_cases],
 )

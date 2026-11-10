@@ -1,4 +1,4 @@
-"""Shared Model Configuration, HITL Governance Callbacks, and Workflow Checkers (app/config.py)."""
+"""Shared Model Configuration, Strategic Model Routing, HITL Callbacks, and Workflow Checkers (app/config.py)."""
 
 import os
 from typing import Any, AsyncGenerator, Optional
@@ -69,12 +69,65 @@ else:
     os.environ.pop("GOOGLE_CLOUD_LOCATION", None)
     os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "False")
 
-_DEFAULT_MODEL = (
-    "gemini-flash-latest"
-    if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() in ("false", "0")
-    else "gemini-2.5-flash"
+_IS_GEMINI_DEVELOPER_API = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() in (
+    "false",
+    "0",
 )
-MODEL_NAME = os.environ.get("RPD_GEMINI_MODEL", _DEFAULT_MODEL)
+
+# Strategic Model Tier Definitions:
+# 1. FLASH_LITE_MODEL_NAME: Context compaction & background summarization
+# 2. FLASH_MODEL_NAME: High-throughput ingestion, SQLite matching, and HITL checkpointing (Agents 1, 2, HITL)
+# 3. PRO_MODEL_NAME: Complex reasoning, Zero-Hallucination KPI verification, and Executive Synthesis (Agents 3, 4)
+FLASH_LITE_MODEL_NAME = os.environ.get(
+    "RPD_GEMINI_FLASH_LITE_MODEL",
+    "gemini-flash-lite-latest" if _IS_GEMINI_DEVELOPER_API else "gemini-2.5-flash-lite",
+)
+FLASH_MODEL_NAME = os.environ.get(
+    "RPD_GEMINI_FLASH_MODEL",
+    os.environ.get(
+        "RPD_GEMINI_MODEL",
+        "gemini-flash-latest" if _IS_GEMINI_DEVELOPER_API else "gemini-2.5-flash",
+    ),
+)
+PRO_MODEL_NAME = os.environ.get(
+    "RPD_GEMINI_PRO_MODEL",
+    "gemini-pro-latest" if _IS_GEMINI_DEVELOPER_API else "gemini-2.5-pro",
+)
+MODEL_NAME = FLASH_MODEL_NAME
+
+# Agent-to-Model Tier Routing Table
+AGENT_MODEL_ROUTING_TABLE: dict[str, dict[str, str]] = {
+    "discovery_industry_classifier": {
+        "tier": "FLASH_LOW_LATENCY",
+        "model": FLASH_MODEL_NAME,
+        "rationale": "High-throughput document ingestion and taxonomy classification",
+    },
+    "repository_matcher_ranker": {
+        "tier": "FLASH_LOW_LATENCY",
+        "model": FLASH_MODEL_NAME,
+        "rationale": "Deterministic SQLite repository querying and weighted score formatting",
+    },
+    "solution_curator_hitl": {
+        "tier": "FLASH_LOW_LATENCY",
+        "model": FLASH_MODEL_NAME,
+        "rationale": "Interactive HITL candidate presentation and session checkpointing",
+    },
+    "value_driver_kpi_engine": {
+        "tier": "PRO_COMPLEX_REASONING",
+        "model": PRO_MODEL_NAME,
+        "rationale": "Strict Zero-Hallucination KPI verification and multi-record proof synthesis",
+    },
+    "executive_opportunity_synthesizer": {
+        "tier": "PRO_COMPLEX_REASONING",
+        "model": PRO_MODEL_NAME,
+        "rationale": "Executive-grade transformation narrative and C-suite report synthesis",
+    },
+    "rpd_transformation_synthesizer": {
+        "tier": "DYNAMIC_HYBRID_ROUTING",
+        "model": PRO_MODEL_NAME,
+        "rationale": "Dynamic routing: Flash for Discovery/Matching/HITL, Pro for Value/Executive Synthesis",
+    },
+}
 
 
 def build_gemini_model(model_name: Optional[str] = None) -> Gemini:
@@ -90,10 +143,25 @@ def build_gemini_model(model_name: Optional[str] = None) -> Gemini:
         client_kwargs = {"api_key": API_KEY}
 
     return Gemini(
-        model=model_name or MODEL_NAME,
+        model=model_name or FLASH_MODEL_NAME,
         retry_options=types.HttpRetryOptions(attempts=3),
         client_kwargs=client_kwargs,
     )
+
+
+def build_flash_lite_model() -> Gemini:
+    """Returns the lightweight Flash-Lite model tier for sliding-window context compaction."""
+    return build_gemini_model(FLASH_LITE_MODEL_NAME)
+
+
+def build_flash_model() -> Gemini:
+    """Returns the Flash model tier for low-latency ingestion, matching, and HITL curation."""
+    return build_gemini_model(FLASH_MODEL_NAME)
+
+
+def build_pro_model() -> Gemini:
+    """Returns the Pro model tier for complex reasoning, KPI verification, and executive report synthesis."""
+    return build_gemini_model(PRO_MODEL_NAME)
 
 
 def enforce_hitl_gate_before_tool(
