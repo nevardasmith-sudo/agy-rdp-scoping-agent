@@ -1,0 +1,39 @@
+{
+  "eval_set_id": "rpd_eval_set_001",
+  "name": "RPD Agent Functional Execution Evals",
+  "eval_cases": [
+    {
+      "eval_id": "test_repository_matcher",
+      "conversation": [
+        {
+          "invocation_id": "turn-1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Match repository use cases for Ancestry record search."
+              }
+            ],
+            "role": "user"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "match_and_score_use_cases",
+                "args": {
+                  "customer_friction_points": [
+                    "unstructured historical record search"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "rpd_scoping_app",
+        "user_id": "test_eval_user",
+        "state": {}
+      }
+    }
+  ]
+}

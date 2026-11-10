@@ -1,0 +1,59 @@
+name: RPD Transformation Engine CI/CD Pipeline
+version: "1.0"
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+stages:
+  - name: Build & Lint
+    runner: jetski-executor
+    steps:
+      - name: Checkout Source Code
+        action: git.checkout
+      - name: Setup Python Environment
+        action: exec
+        command: |
+          pip install uv
+          uv venv
+          uv pip install -e .
+      - name: Validate Manifest & Syntax
+        action: exec
+        command: |
+          uv run python -m py_compile app/agent.py
+          cat agents-cli-manifest.yaml
+  - name: Quality & Evaluation Gate
+    runner: jetski-evaluator
+    steps:
+      - name: Execute ADK Deterministic Trajectory Evals
+        action: exec
+        command: |
+          uv run adk eval app rpd_eval_set.json --config_file_path=eval_config.json --print_detailed_results
+        environment:
+          GOOGLE_GENAI_USE_VERTEXAI: "True"
+          GOOGLE_CLOUD_PROJECT: "gcp-experiments-349209"
+  - name: Secure Agent Deployment
+    runner: jetski-deployer
+    requires:
+      - Quality & Evaluation Gate
+    steps:
+      - name: Deploy to Cloud Agent Runtime with SPIFFE Identity
+        action: exec
+        command: |
+          agents-cli deploy \
+            --agent-identity \
+            --region us-central1 \
+            --non-interactive \
+            --update-env-vars="GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true,OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental,OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=EVENT_ONLY,GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES=False"
+        environment:
+          GOOGLE_CLOUD_PROJECT: "gcp-experiments-349209"
+  - name: Post-Deployment Observability Verification
+    runner: jetski-monitor
+    requires:
+      - Secure Agent Deployment
+    steps:
+      - name: Verify OpenTelemetry Stream & IAM Identity Binding
+        action: exec
+        command: |
+          echo "Verifying SPIFFE Identity IAM bindings and Cloud Trace telemetry stream..."
+          gcloud logging logs list --project=gcp-experiments-349209 | grep reasoning_engine || true

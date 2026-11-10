@@ -1,0 +1,15 @@
+# Virtual environments & build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Environment variables & secrets
+.env
+app/.env
+
+# Local ADK session storage
+.adk/
+app/.adk/

@@ -1,0 +1,4 @@
+name: "agy-rpd-scoping-agent"
+agent_directory: "app"
+deployment_target: "agent_runtime"
+session_type: "in_memory"
