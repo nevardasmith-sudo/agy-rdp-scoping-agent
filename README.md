@@ -1,23 +1,25 @@
-# agy-rpd-scoping-agent (`v1.0.0` — Production Hardened Release)
+# agy-rpd-scoping-agent (`v1.1` — Production Hardened Release)
 
 Repeatable, Portable, and Demoable (RPD) Transformation Engine built on the Google Agent Development Kit (ADK) for the Gemini Enterprise Agent Platform.
 
-## Production Hardening Highlights (`v1.0.0` — 100/100 Scorecard)
+## Production Hardening Highlights (`v1.1` — 100/100 Scorecard)
 
 1. **Tool & Interface Design (`app/tools/`)**:
    - SSRF & Private IP protection (`_is_safe_public_url`) blocking loopback, link-local (`169.254.169.254`), and RFC1918 addresses in `ingest_customer_sources`.
    - Read-only SQLite URI enforcement (`?mode=ro`) across `load_repository_from_sqlite` and `_lookup_sqlite_record`.
    - Strict Pydantic input/output validation (`IngestSourcesInput`, `MatchUseCasesInput`, `ApprovedUseCases`, `ExtractValueInput`, `ValueAnalysisDossier`, `TransformationOpportunityReport`) and stem-aware semantic friction matching.
-2. **Context & Memory (`app/agent.py`, `app/agent_hitl.py`)**:
+2. **Context, Memory, & Active PII Scrubbing (`app/agent.py`, `app/agent_hitl.py`, `app/telemetry.py`)**:
+   - Active PII & Secret Redaction Engine (`scrub_pii`, `scrub_pii_payload`, `scrub_session_and_memory_state`, `PiiRedactingFilter`) scrubbing emails, SSNs, credit cards, phone numbers, API keys, and sensitive keys across ingestion, session memory, Firestore HITL checkpoints, OpenTelemetry spans, and structured logs.
    - Deterministic `initialize_rpd_session_state` (`before_agent_callback`) and per-session `ToolContext` isolation.
-   - Sliding-window `EventsCompactionConfig` (`compaction_interval=5, overlap_size=1`) with `LlmEventSummarizer`.
+   - Sliding-window `EventsCompactionConfig` (`compaction_interval=5, overlap_size=1`) with `LlmEventSummarizer` on Flash-Lite (`build_flash_lite_model`).
    - Bundled `app/data/fsi_use_cases.db` (145 verified `Deployed - Field Ready` use cases across 7 verticals).
-3. **Orchestration & Logic (`app/config.py`, `app/agent.py`)**:
+3. **Orchestration, Logic, & Strategic Model Routing (`app/config.py`, `app/agent.py`)**:
+   - 3-Tier Strategic Model Routing (`Flash-Lite` for context compaction, `Flash` for Discovery/Matching/HITL, and `Pro` for Zero-Hallucination Value Analysis & Executive Synthesis) enforced dynamically via `strategic_model_router_callback` (`before_model_callback`).
    - Programmatic HITL gate (`enforce_hitl_gate_before_tool`) blocking same-turn auto-approval and unapproved downstream execution.
    - Explicit `SequentialAgent` (`rpd_sequential_pipeline`), `LoopAgent` (`rpd_value_validation_loop`), and `EscalationChecker(BaseAgent)` workflows with `output_key` state routing.
 4. **Observability & Tracing (`app/telemetry.py`, `app/fast_api_app.py`)**:
-   - OpenTelemetry `TracerProvider` and custom spans (`rpd.match_and_score_use_cases`, `rpd.extract_verified_value_and_kpis`, `rpd.synthesize_transformation_report`).
-   - Google Cloud Structured JSON audit logs (`SSRF_URL_BLOCKED`, `HARD_GATE_FILTER`, `HITL_DECISION`, `UNGROUNDED_KPI_BLOCKED`, `REPORT_SYNTHESIZED`) with trace correlation and `/healthz` readiness probe.
+   - OpenTelemetry `TracerProvider` and custom spans (`rpd.match_and_score_use_cases`, `rpd.extract_verified_value_and_kpis`, `rpd.synthesize_transformation_report`, `rpd.strategic_model_router`).
+   - Google Cloud Structured JSON audit logs (`SSRF_URL_BLOCKED`, `PII_REDACTED`, `HARD_GATE_FILTER`, `HITL_DECISION`, `UNGROUNDED_KPI_BLOCKED`, `MODEL_ROUTING_DECISION`, `LLM_TOKEN_USAGE`, `REPORT_SYNTHESIZED`) with trace correlation and `/healthz` readiness probe.
 5. **Infrastructure & CI/CD (`Dockerfile`, `.antigravity/pipeline.yaml`, `rpd_eval_set.json`)**:
    - Multi-stage non-root `Dockerfile` (`uid 10001`), 4-case trajectory & adversarial evaluation suite (`rpd_eval_set.json`), and automated CI/CD pipelines.
 
